@@ -6,7 +6,10 @@
     "permissions": [
         "storage"
     ],
-    "host_permissions": ["https://www.facebook.com/*"],
+    "host_permissions": [
+        "https://www.facebook.com/*",
+        "https://api.openai.com/*"
+    ],
     "action": {},
     "background": {
         "service_worker": "background.js"

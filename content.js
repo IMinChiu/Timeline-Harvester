@@ -6,9 +6,12 @@ script.src = chrome.runtime.getURL('injected.js');
 (document.head || document.documentElement).appendChild(script);
 
 let scrappedPosts = [];
+let enhancedPosts = []; // Posts after LLM analysis
 let isScrolling = false; // Set to false, don't auto-start
-const MAX_POSTS = 15; // Set your limit here
+const MAX_POSTS = 10; // Set your limit here
 let overlayElement = null;
+let isAnalyzing = false; // Track if LLM analysis is in progress
+let analysisStatus = 'idle'; // 'idle', 'waiting_for_raw', 'analyzing', 'complete'
 
 // Configuration state
 let config = {
@@ -16,7 +19,7 @@ let config = {
     prompt: '',
     llmProvider: 'openai', // 'openai' or 'gemini'
     openai: {
-        model: 'gpt-4',
+        model: 'gpt-5-mini-2025-08-07',
         apiKey: ''
     },
     gemini: {
@@ -27,10 +30,8 @@ let config = {
 
 // OpenAI models
 const OPENAI_MODELS = [
-    { value: 'gpt-4', label: 'GPT-4' },
-    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
-    { value: 'gpt-4o', label: 'GPT-4o' },
-    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo' }
+    { value: 'gpt-5-mini-2025-08-07', label: 'GPT-5 Mini' },
+    { value: 'gpt-5-nano-2025-08-07', label: 'GPT-5 Nano' }
 ];
 
 // Gemini models
@@ -82,6 +83,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 if (!isScrolling) {
                     isScrolling = true;
                     scrappedPosts = []; // Reset data
+                    enhancedPosts = []; // Reset enhanced posts
+                    analysisStatus = 'waiting_for_raw'; // Set status
                     console.log("Starting scraping...");
                     autoScroll();
                     updateOverlay();
@@ -91,6 +94,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 if (!isScrolling) {
                     isScrolling = true;
                     scrappedPosts = []; // Reset data
+                    enhancedPosts = []; // Reset enhanced posts
+                    analysisStatus = 'waiting_for_raw'; // Set status
                     console.log("Starting scraping...");
                     await showOverlay();
                     autoScroll();
@@ -106,6 +111,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (!isScrolling) {
                 isScrolling = true;
                 scrappedPosts = []; // Reset data
+                enhancedPosts = []; // Reset enhanced posts
+                analysisStatus = 'waiting_for_raw'; // Set status
                 console.log("Starting scraping...");
                 await showOverlay();
                 autoScroll();
@@ -181,6 +188,8 @@ function parseAndStore(json) {
 
     if (scrappedPosts.length >= MAX_POSTS) {
         stopAndSave();
+        // Trigger LLM analysis
+        analyzePostsWithLLM();
     }
 }
 
@@ -218,6 +227,175 @@ function stopAndSave() {
     
     // Notify popup that status has changed
     chrome.runtime.sendMessage({ type: 'statusChanged', isRunning: false });
+}
+
+// Analyze posts with LLM
+async function analyzePostsWithLLM() {
+    if (isAnalyzing || scrappedPosts.length === 0) return;
+    
+    // Filter out sponsor/ad posts
+    const userPosts = scrappedPosts.filter(post => post.type === 'user');
+    if (userPosts.length === 0) {
+        analysisStatus = 'complete';
+        enhancedPosts = [];
+        updateOverlay();
+        return;
+    }
+    
+    isAnalyzing = true;
+    analysisStatus = 'analyzing';
+    updateOverlay();
+    
+    try {
+        await loadConfig();
+        
+        if (!config.openai.apiKey) {
+            console.error('OpenAI API key not configured');
+            analysisStatus = 'error';
+            isAnalyzing = false;
+            updateOverlay();
+            return;
+        }
+        
+        // Prepare prompt for LLM
+        const postsData = userPosts.map((post, index) => ({
+            id: index + 1,
+            author: post.poster.name,
+            content: post.story_content || '(No content)',
+            link: post.permanent_link
+        }));
+        
+        const systemPrompt = `You are analyzing Facebook posts. For each post, provide:
+1. A category/tag (e.g., Tech, News, Personal, etc.)
+2. A brief summary (2-3 sentences)
+3. An importance score (1-10, where 10 is most important)
+
+Return a JSON object with a "posts" array where each object has:
+- id: the post id (number)
+- category: string
+- summary: string
+- importance: number (1-10)
+
+Order the results by importance (highest first). The response must be valid JSON with this structure:
+{
+  "posts": [
+    {"id": 1, "category": "...", "summary": "...", "importance": 8},
+    ...
+  ]
+}`;
+
+        const userPrompt = config.prompt 
+            ? `${config.prompt}\n\nPosts to analyze:\n${JSON.stringify(postsData, null, 2)}`
+            : `Analyze these Facebook posts:\n${JSON.stringify(postsData, null, 2)}`;
+        
+        // Call OpenAI API
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${config.openai.apiKey}`
+            },
+            body: JSON.stringify({
+                model: config.openai.model || 'gpt-5-mini-2025-08-07',
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: userPrompt }
+                ],
+                response_format: { type: 'json_object' },
+            })
+        });
+        
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error?.message || 'API request failed');
+        }
+        
+        const data = await response.json();
+        const analysisText = data.choices[0]?.message?.content;
+        
+        if (!analysisText) {
+            throw new Error('No response from LLM');
+        }
+        
+        // Parse the JSON response
+        let analysisResult;
+        try {
+            analysisResult = JSON.parse(analysisText);
+        } catch (e) {
+            // Try to extract JSON from markdown code blocks
+            const jsonMatch = analysisText.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+            if (jsonMatch) {
+                analysisResult = JSON.parse(jsonMatch[1]);
+            } else {
+                // Try to find JSON object in the text
+                const jsonObjMatch = analysisText.match(/\{[\s\S]*\}/);
+                if (jsonObjMatch) {
+                    analysisResult = JSON.parse(jsonObjMatch[0]);
+                } else {
+                    throw new Error('Failed to parse LLM response');
+                }
+            }
+        }
+        
+        // Map analysis results back to posts
+        const analysisMap = {};
+        if (Array.isArray(analysisResult)) {
+            analysisResult.forEach(item => {
+                if (item.id) {
+                    analysisMap[item.id] = item;
+                }
+            });
+        } else if (analysisResult.posts && Array.isArray(analysisResult.posts)) {
+            analysisResult.posts.forEach(item => {
+                if (item.id) {
+                    analysisMap[item.id] = item;
+                }
+            });
+        } else if (analysisResult.analysis && Array.isArray(analysisResult.analysis)) {
+            analysisResult.analysis.forEach(item => {
+                if (item.id) {
+                    analysisMap[item.id] = item;
+                }
+            });
+        } else {
+            // If it's an object with numeric keys or id-based keys
+            Object.keys(analysisResult).forEach(key => {
+                const item = analysisResult[key];
+                if (item && typeof item === 'object') {
+                    if (item.id) {
+                        analysisMap[item.id] = item;
+                    } else if (!isNaN(key)) {
+                        // Numeric key might be the id
+                        analysisMap[parseInt(key)] = item;
+                    }
+                }
+            });
+        }
+        
+        // Create enhanced posts
+        enhancedPosts = userPosts
+            .map((post, index) => {
+                const analysis = analysisMap[index + 1] || analysisMap[String(index + 1)] || {};
+                return {
+                    ...post,
+                    category: analysis.category || 'Uncategorized',
+                    summary: analysis.summary || 'No summary available',
+                    importance: analysis.importance || analysis.score || 5
+                };
+            })
+            .sort((a, b) => (b.importance || 5) - (a.importance || 5)); // Sort by importance
+        
+        analysisStatus = 'complete';
+        console.log('LLM analysis complete', enhancedPosts);
+        
+    } catch (error) {
+        console.error('LLM analysis failed:', error);
+        analysisStatus = 'error';
+        enhancedPosts = [];
+    } finally {
+        isAnalyzing = false;
+        updateOverlay();
+    }
 }
 
 // Overlay UI Functions
@@ -260,13 +438,23 @@ async function showOverlay() {
                 </div>
             </div>
             <div class="fb-scraper-tabs">
-                <button class="fb-scraper-tab active" data-tab="posts">📋 Posts</button>
+                <button class="fb-scraper-tab active" data-tab="raw">📋 Raw</button>
+                <button class="fb-scraper-tab" data-tab="enhanced">✨ Enhanced Feed</button>
                 <button class="fb-scraper-tab" data-tab="config">⚙️ Configuration</button>
             </div>
             <div class="fb-scraper-content">
-                <div class="fb-scraper-tab-content active" id="fb-scraper-tab-posts">
+                <div class="fb-scraper-tab-content active" id="fb-scraper-tab-raw">
                     <div class="fb-scraper-posts" id="fb-scraper-posts-list">
                         <div class="fb-scraper-empty">Waiting for posts...</div>
+                    </div>
+                </div>
+                <div class="fb-scraper-tab-content" id="fb-scraper-tab-enhanced">
+                    <div class="fb-scraper-enhanced-header">
+                        <button class="fb-scraper-btn fb-scraper-btn-analyze" id="fb-scraper-reanalyze-btn">🔄 Re-analyze</button>
+                    </div>
+                    <div class="fb-scraper-enhanced-status" id="fb-scraper-enhanced-status"></div>
+                    <div class="fb-scraper-posts" id="fb-scraper-enhanced-list">
+                        <div class="fb-scraper-empty">Waiting for raw feed fetching...</div>
                     </div>
                 </div>
                 <div class="fb-scraper-tab-content" id="fb-scraper-tab-config">
@@ -697,6 +885,115 @@ async function showOverlay() {
         .fb-scraper-btn-save:hover {
             background: #059669;
         }
+        .fb-scraper-enhanced-header {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 16px;
+        }
+        .fb-scraper-btn-analyze {
+            background: #8b5cf6;
+            color: #fff;
+        }
+        .fb-scraper-btn-analyze:hover {
+            background: #7c3aed;
+            transform: translateY(-1px);
+        }
+        .fb-scraper-enhanced-status {
+            margin-bottom: 16px;
+            padding: 12px;
+            background: #252525;
+            border-radius: 8px;
+            border-left: 4px solid #4267B2;
+        }
+        .fb-scraper-status-message {
+            color: #fff;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .fb-scraper-status-message.error {
+            color: #ff6b6b;
+        }
+        .fb-scraper-enhanced-post {
+            border-left-color: #8b5cf6;
+        }
+        .fb-scraper-post-meta {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .fb-scraper-post-category {
+            background: #8b5cf6;
+            color: #fff;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 11px;
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+        .fb-scraper-post-importance {
+            background: #333;
+            color: #fff;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .fb-scraper-post-summary {
+            background: #2a2a2a;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            color: #ddd;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .fb-scraper-post-summary strong {
+            color: #8b5cf6;
+        }
+        .fb-scraper-enhanced-content {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: none;
+            overflow: visible;
+        }
+        .fb-scraper-content-collapsed {
+            max-height: 0;
+            overflow: hidden;
+            padding: 0;
+            margin: 0;
+            transition: max-height 0.3s ease-out, padding 0.3s ease-out, margin 0.3s ease-out;
+        }
+        .fb-scraper-content-toggle-wrapper {
+            margin-bottom: 12px;
+        }
+        .fb-scraper-content-toggle {
+            background: #333;
+            border: 1px solid #444;
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+            margin-bottom: 8px;
+        }
+        .fb-scraper-content-toggle:hover {
+            background: #444;
+            border-color: #555;
+        }
+        .fb-scraper-content-toggle .toggle-icon {
+            font-size: 10px;
+            transition: transform 0.2s;
+        }
+        .fb-scraper-content-toggle .toggle-text {
+            user-select: none;
+        }
     `;
     document.head.appendChild(style);
     document.body.appendChild(overlayElement);
@@ -714,13 +1011,15 @@ async function showOverlay() {
     const startBtn = document.getElementById('fb-scraper-start-btn');
     if (startBtn) {
         startBtn.addEventListener('click', () => {
-            if (!isScrolling) {
-                isScrolling = true;
-                scrappedPosts = []; // Reset data
-                console.log("Starting scraping...");
-                autoScroll();
-                updateOverlay();
-            }
+                if (!isScrolling) {
+                    isScrolling = true;
+                    scrappedPosts = []; // Reset data
+                    enhancedPosts = []; // Reset enhanced posts
+                    analysisStatus = 'waiting_for_raw'; // Set status
+                    console.log("Starting scraping...");
+                    autoScroll();
+                    updateOverlay();
+                }
         });
     }
 
@@ -750,8 +1049,29 @@ async function showOverlay() {
             
             button.classList.add('active');
             document.getElementById(`fb-scraper-tab-${targetTab}`).classList.add('active');
+            
+            // Update enhanced feed when switching to it
+            if (targetTab === 'enhanced') {
+                updateOverlay();
+            }
         });
     });
+
+    // Re-analyze button
+    const reAnalyzeBtn = document.getElementById('fb-scraper-reanalyze-btn');
+    if (reAnalyzeBtn) {
+        reAnalyzeBtn.addEventListener('click', async () => {
+            if (scrappedPosts.length === 0) {
+                alert('No posts to analyze. Please collect posts first.');
+                return;
+            }
+            if (isAnalyzing) {
+                alert('Analysis already in progress. Please wait.');
+                return;
+            }
+            await analyzePostsWithLLM();
+        });
+    }
 
     // Save config button
     const saveConfigBtn = document.getElementById('fb-scraper-save-config');
@@ -823,7 +1143,7 @@ async function showOverlay() {
             
             const openaiModel = document.getElementById('llm-openai-model');
             const openaiApiKey = document.getElementById('llm-openai-apikey');
-            if (openaiModel) openaiModel.value = config.openai.model || 'gpt-4';
+            if (openaiModel) openaiModel.value = config.openai.model || 'gpt-5-mini-2025-08-07';
             if (openaiApiKey) openaiApiKey.value = config.openai.apiKey || '';
             
             const geminiModel = document.getElementById('llm-gemini-model');
@@ -842,6 +1162,8 @@ function updateOverlay() {
     const countEl = overlayElement.querySelector('#fb-scraper-count');
     const statusEl = overlayElement.querySelector('#fb-scraper-status');
     const postsListEl = overlayElement.querySelector('#fb-scraper-posts-list');
+    const enhancedListEl = overlayElement.querySelector('#fb-scraper-enhanced-list');
+    const enhancedStatusEl = overlayElement.querySelector('#fb-scraper-enhanced-status');
     const startBtn = overlayElement.querySelector('#fb-scraper-start-btn');
     const stopBtn = overlayElement.querySelector('#fb-scraper-stop-btn');
 
@@ -865,6 +1187,7 @@ function updateOverlay() {
         stopBtn.style.display = isScrolling ? 'block' : 'none';
     }
 
+    // Update Raw tab posts
     if (postsListEl) {
         if (scrappedPosts.length === 0) {
             postsListEl.innerHTML = '<div class="fb-scraper-empty">Waiting for posts...</div>';
@@ -878,7 +1201,7 @@ function updateOverlay() {
                         <span class="fb-scraper-post-type ${post.type}">${post.type}</span>
                     </div>
                     <div class="fb-scraper-post-content">
-                        ${post.story_content || '(No content)'}
+                        ${escapeHtml(post.story_content || '(No content)').replace(/\n/g, '<br>')}
                     </div>
                     <a href="${post.permanent_link}" target="_blank" class="fb-scraper-post-link">
                         ${post.permanent_link}
@@ -887,6 +1210,95 @@ function updateOverlay() {
             `).join('');
         }
     }
+
+    // Update Enhanced Feed tab
+    if (enhancedStatusEl) {
+        if (scrappedPosts.length === 0 || (analysisStatus === 'waiting_for_raw' && isScrolling)) {
+            enhancedStatusEl.innerHTML = '<div class="fb-scraper-status-message">⏳ Waiting for raw feed fetching...</div>';
+            enhancedStatusEl.style.display = 'block';
+        } else if (isAnalyzing || analysisStatus === 'analyzing') {
+            enhancedStatusEl.innerHTML = '<div class="fb-scraper-status-message">🤖 Waiting for LLM analysis...</div>';
+            enhancedStatusEl.style.display = 'block';
+        } else if (analysisStatus === 'error') {
+            enhancedStatusEl.innerHTML = '<div class="fb-scraper-status-message error">❌ Analysis failed. Check console for details.</div>';
+            enhancedStatusEl.style.display = 'block';
+        } else if (analysisStatus === 'complete' && enhancedPosts.length > 0) {
+            enhancedStatusEl.style.display = 'none';
+        } else if (scrappedPosts.length > 0 && (analysisStatus === 'idle' || analysisStatus === 'waiting_for_raw')) {
+            // Posts collected but not analyzed yet
+            enhancedStatusEl.innerHTML = '<div class="fb-scraper-status-message">📋 Raw posts collected. Click "Re-analyze" to process them.</div>';
+            enhancedStatusEl.style.display = 'block';
+        } else {
+            enhancedStatusEl.style.display = 'none';
+        }
+    }
+
+    if (enhancedListEl) {
+        if (scrappedPosts.length === 0) {
+            enhancedListEl.innerHTML = '<div class="fb-scraper-empty">Waiting for raw feed fetching...</div>';
+        } else if (isAnalyzing || analysisStatus === 'analyzing') {
+            enhancedListEl.innerHTML = '<div class="fb-scraper-empty">Waiting for LLM analysis...</div>';
+        } else if (analysisStatus === 'error') {
+            enhancedListEl.innerHTML = '<div class="fb-scraper-empty">Analysis failed. Click "Re-analyze" to try again.</div>';
+        } else if (enhancedPosts.length === 0 && scrappedPosts.length > 0) {
+            enhancedListEl.innerHTML = '<div class="fb-scraper-empty">No user posts found (only sponsor/ad content).</div>';
+        } else if (enhancedPosts.length > 0) {
+            enhancedListEl.innerHTML = enhancedPosts.map((post, index) => `
+                <div class="fb-scraper-post fb-scraper-enhanced-post">
+                    <div class="fb-scraper-post-header">
+                        <a href="${post.poster.link}" target="_blank" class="fb-scraper-post-author">
+                            ${escapeHtml(post.poster.name)}
+                        </a>
+                        <div class="fb-scraper-post-meta">
+                            <span class="fb-scraper-post-category">${escapeHtml(post.category || 'Uncategorized')}</span>
+                            ${post.importance ? `<span class="fb-scraper-post-importance">⭐ ${post.importance}/10</span>` : ''}
+                        </div>
+                    </div>
+                    <div class="fb-scraper-post-summary">
+                        <strong>Summary:</strong> ${escapeHtml(post.summary || 'No summary available')}
+                    </div>
+                    <div class="fb-scraper-content-toggle-wrapper">
+                        <button class="fb-scraper-content-toggle" data-post-index="${index}" type="button">
+                            <span class="toggle-icon">▼</span> <span class="toggle-text">Show Raw Content</span>
+                        </button>
+                        <div class="fb-scraper-post-content fb-scraper-enhanced-content fb-scraper-content-collapsed" data-post-content="${index}">
+                            ${escapeHtml(post.story_content || '(No content)').replace(/\n/g, '<br>')}
+                        </div>
+                    </div>
+                    <a href="${post.permanent_link}" target="_blank" class="fb-scraper-post-link">
+                        ${post.permanent_link}
+                    </a>
+                </div>
+            `).join('');
+            
+            // Add event listeners for toggle buttons
+            enhancedListEl.querySelectorAll('.fb-scraper-content-toggle').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const postIndex = button.getAttribute('data-post-index');
+                    const contentEl = enhancedListEl.querySelector(`[data-post-content="${postIndex}"]`);
+                    const toggleIcon = button.querySelector('.toggle-icon');
+                    const toggleText = button.querySelector('.toggle-text');
+                    
+                    if (contentEl.classList.contains('fb-scraper-content-collapsed')) {
+                        contentEl.classList.remove('fb-scraper-content-collapsed');
+                        toggleIcon.textContent = '▲';
+                        toggleText.textContent = 'Hide Raw Content';
+                    } else {
+                        contentEl.classList.add('fb-scraper-content-collapsed');
+                        toggleIcon.textContent = '▼';
+                        toggleText.textContent = 'Show Raw Content';
+                    }
+                });
+            });
+        }
+    }
+}
+
+// Helper function to escape HTML
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 function hideOverlay() {
