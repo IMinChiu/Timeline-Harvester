@@ -10,6 +10,61 @@ let isScrolling = false; // Set to false, don't auto-start
 const MAX_POSTS = 15; // Set your limit here
 let overlayElement = null;
 
+// Configuration state
+let config = {
+    category: '',
+    prompt: '',
+    llmProvider: 'openai', // 'openai' or 'gemini'
+    openai: {
+        model: 'gpt-4',
+        apiKey: ''
+    },
+    gemini: {
+        model: 'gemini-pro',
+        apiKey: ''
+    }
+};
+
+// OpenAI models
+const OPENAI_MODELS = [
+    { value: 'gpt-4', label: 'GPT-4' },
+    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+    { value: 'gpt-4o', label: 'GPT-4o' },
+    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo' }
+];
+
+// Gemini models
+const GEMINI_MODELS = [
+    { value: 'gemini-pro', label: 'Gemini Pro' },
+    { value: 'gemini-pro-vision', label: 'Gemini Pro Vision' },
+    { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+    { value: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' }
+];
+
+// Load configuration from storage
+async function loadConfig() {
+    try {
+        const result = await chrome.storage.local.get(['scraperConfig']);
+        if (result.scraperConfig) {
+            config = { ...config, ...result.scraperConfig };
+        }
+    } catch (error) {
+        console.error('Failed to load config:', error);
+    }
+}
+
+// Save configuration to storage
+async function saveConfig() {
+    try {
+        await chrome.storage.local.set({ scraperConfig: config });
+    } catch (error) {
+        console.error('Failed to save config:', error);
+    }
+}
+
+// Load config on script start
+loadConfig();
+
 // 2. Listen for messages from the injected script
 window.addEventListener("message", (event) => {
     if (event.data.type === "FB_GRAPHQL_DATA") {
@@ -21,39 +76,45 @@ window.addEventListener("message", (event) => {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === 'toggleAndStart') {
         // Toggle overlay and start scraping if not already running
-        if (overlayElement) {
-            // If overlay is open, just start if not running
-            if (!isScrolling) {
-                isScrolling = true;
-                scrappedPosts = []; // Reset data
-                console.log("Starting scraping...");
-                autoScroll();
-                updateOverlay();
-            }
-        } else {
-            // If overlay is closed, open it and start
-            if (!isScrolling) {
-                isScrolling = true;
-                scrappedPosts = []; // Reset data
-                console.log("Starting scraping...");
-                showOverlay();
-                autoScroll();
+        (async () => {
+            if (overlayElement) {
+                // If overlay is open, just start if not running
+                if (!isScrolling) {
+                    isScrolling = true;
+                    scrappedPosts = []; // Reset data
+                    console.log("Starting scraping...");
+                    autoScroll();
+                    updateOverlay();
+                }
             } else {
-                showOverlay();
+                // If overlay is closed, open it and start
+                if (!isScrolling) {
+                    isScrolling = true;
+                    scrappedPosts = []; // Reset data
+                    console.log("Starting scraping...");
+                    await showOverlay();
+                    autoScroll();
+                } else {
+                    await showOverlay();
+                }
             }
-        }
-        sendResponse({ success: true, isRunning: isScrolling });
+            sendResponse({ success: true, isRunning: isScrolling });
+        })();
+        return true; // Keep message channel open for async response
     } else if (request.action === 'start') {
-        if (!isScrolling) {
-            isScrolling = true;
-            scrappedPosts = []; // Reset data
-            console.log("Starting scraping...");
-            showOverlay();
-            autoScroll();
-            sendResponse({ success: true, isRunning: true });
-        } else {
-            sendResponse({ success: false, message: 'Already running' });
-        }
+        (async () => {
+            if (!isScrolling) {
+                isScrolling = true;
+                scrappedPosts = []; // Reset data
+                console.log("Starting scraping...");
+                await showOverlay();
+                autoScroll();
+                sendResponse({ success: true, isRunning: true });
+            } else {
+                sendResponse({ success: false, message: 'Already running' });
+            }
+        })();
+        return true; // Keep message channel open for async response
     } else if (request.action === 'stop') {
         if (isScrolling) {
             isScrolling = false;
@@ -65,12 +126,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
     } else if (request.action === 'toggle') {
         // Toggle overlay visibility
-        if (overlayElement) {
-            hideOverlay();
-        } else {
-            showOverlay();
-        }
-        sendResponse({ success: true });
+        (async () => {
+            if (overlayElement) {
+                hideOverlay();
+            } else {
+                await showOverlay();
+            }
+            sendResponse({ success: true });
+        })();
+        return true; // Keep message channel open for async response
     } else if (request.action === 'getStatus') {
         sendResponse({ isRunning: isScrolling });
     }
@@ -78,13 +142,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // Keyboard shortcut to toggle overlay (Ctrl+Shift+H or Cmd+Shift+H)
-document.addEventListener('keydown', (e) => {
+document.addEventListener('keydown', async (e) => {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'H') {
         e.preventDefault();
         if (overlayElement) {
             hideOverlay();
         } else {
-            showOverlay();
+            await showOverlay();
         }
     }
 });
@@ -157,10 +221,13 @@ function stopAndSave() {
 }
 
 // Overlay UI Functions
-function showOverlay() {
+async function showOverlay() {
     if (overlayElement) {
         overlayElement.remove();
     }
+
+    // Ensure config is loaded before showing overlay
+    await loadConfig();
 
     overlayElement = document.createElement('div');
     overlayElement.id = 'fb-scraper-overlay';
@@ -192,9 +259,82 @@ function showOverlay() {
                     <span class="stat-value" id="fb-scraper-status">${isScrolling ? '🟢 Scraping...' : '🔴 Stopped'}</span>
                 </div>
             </div>
+            <div class="fb-scraper-tabs">
+                <button class="fb-scraper-tab active" data-tab="posts">📋 Posts</button>
+                <button class="fb-scraper-tab" data-tab="config">⚙️ Configuration</button>
+            </div>
             <div class="fb-scraper-content">
-                <div class="fb-scraper-posts" id="fb-scraper-posts-list">
-                    <div class="fb-scraper-empty">Waiting for posts...</div>
+                <div class="fb-scraper-tab-content active" id="fb-scraper-tab-posts">
+                    <div class="fb-scraper-posts" id="fb-scraper-posts-list">
+                        <div class="fb-scraper-empty">Waiting for posts...</div>
+                    </div>
+                </div>
+                <div class="fb-scraper-tab-content" id="fb-scraper-tab-config">
+                    <div class="fb-scraper-config">
+                        <div class="fb-scraper-config-section">
+                            <label class="fb-scraper-config-label">Category</label>
+                            <input type="text" 
+                                   class="fb-scraper-config-input" 
+                                   id="fb-scraper-category" 
+                                   placeholder="e.g., Ad, Tech, LLM..."
+                                   value="${config.category}">
+                            <div class="fb-scraper-config-hint">Enter a category to tag your scraped posts</div>
+                        </div>
+                        
+                        <div class="fb-scraper-config-section">
+                            <label class="fb-scraper-config-label">LLM Provider & Model</label>
+                            <div class="fb-scraper-llm-row">
+                                <input type="radio" 
+                                       name="llm-provider" 
+                                       id="llm-openai" 
+                                       value="openai" 
+                                       ${config.llmProvider === 'openai' ? 'checked' : ''}>
+                                <label for="llm-openai" class="fb-scraper-llm-label">OPEN AI</label>
+                                <select class="fb-scraper-llm-select" id="llm-openai-model">
+                                    ${OPENAI_MODELS.map(m => 
+                                        `<option value="${m.value}" ${config.openai.model === m.value ? 'selected' : ''}>${m.label}</option>`
+                                    ).join('')}
+                                </select>
+                                <input type="password" 
+                                       class="fb-scraper-llm-apikey" 
+                                       id="llm-openai-apikey" 
+                                       placeholder="API Key"
+                                       value="${config.openai.apiKey}">
+                            </div>
+                            <div class="fb-scraper-llm-row">
+                                <input type="radio" 
+                                       name="llm-provider" 
+                                       id="llm-gemini" 
+                                       value="gemini" 
+                                       ${config.llmProvider === 'gemini' ? 'checked' : ''}>
+                                <label for="llm-gemini" class="fb-scraper-llm-label">GEMINI</label>
+                                <select class="fb-scraper-llm-select" id="llm-gemini-model">
+                                    ${GEMINI_MODELS.map(m => 
+                                        `<option value="${m.value}" ${config.gemini.model === m.value ? 'selected' : ''}>${m.label}</option>`
+                                    ).join('')}
+                                </select>
+                                <input type="password" 
+                                       class="fb-scraper-llm-apikey" 
+                                       id="llm-gemini-apikey" 
+                                       placeholder="API Key"
+                                       value="${config.gemini.apiKey}">
+                            </div>
+                            <div class="fb-scraper-config-hint">Select one LLM provider and configure its model and API key</div>
+                        </div>
+                        
+                        <div class="fb-scraper-config-section">
+                            <label class="fb-scraper-config-label">LLM Prompt</label>
+                            <textarea class="fb-scraper-config-textarea" 
+                                      id="fb-scraper-prompt" 
+                                      placeholder="Enter instructions for the LLM to analyze the scraped posts..."
+                                      rows="6">${config.prompt || ''}</textarea>
+                            <div class="fb-scraper-config-hint">Enter the prompt/instructions that will be sent to the LLM for analyzing the scraped posts</div>
+                        </div>
+                        
+                        <div class="fb-scraper-config-actions">
+                            <button class="fb-scraper-btn fb-scraper-btn-save" id="fb-scraper-save-config">💾 Save Configuration</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -315,10 +455,45 @@ function showOverlay() {
             font-size: 20px;
             font-weight: 600;
         }
-        .fb-scraper-content {
+        .fb-scraper-tabs {
+            display: flex;
+            gap: 8px;
+            padding: 0 32px;
+            border-bottom: 1px solid #333;
+            background: #222;
+        }
+        .fb-scraper-tab {
+            padding: 12px 24px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: #999;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .fb-scraper-tab:hover {
+            color: #fff;
+        }
+        .fb-scraper-tab.active {
+            color: #4267B2;
+            border-bottom-color: #4267B2;
+        }
+        .fb-scraper-tab-content {
+            display: none;
             flex: 1;
             overflow-y: auto;
             padding: 24px 32px;
+        }
+        .fb-scraper-tab-content.active {
+            display: block;
+        }
+        .fb-scraper-content {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
         }
         .fb-scraper-posts {
             display: flex;
@@ -404,6 +579,124 @@ function showOverlay() {
         .fb-scraper-content::-webkit-scrollbar-thumb:hover {
             background: #555;
         }
+        .fb-scraper-config {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        .fb-scraper-config-section {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .fb-scraper-config-label {
+            color: #fff;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .fb-scraper-config-input {
+            padding: 12px 16px;
+            background: #252525;
+            border: 1px solid #333;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .fb-scraper-config-input:focus {
+            outline: none;
+            border-color: #4267B2;
+            background: #2a2a2a;
+        }
+        .fb-scraper-config-textarea {
+            padding: 12px 16px;
+            background: #252525;
+            border: 1px solid #333;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 14px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            resize: vertical;
+            transition: all 0.2s;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .fb-scraper-config-textarea:focus {
+            outline: none;
+            border-color: #4267B2;
+            background: #2a2a2a;
+        }
+        .fb-scraper-config-textarea::placeholder {
+            color: #666;
+        }
+        .fb-scraper-config-hint {
+            color: #999;
+            font-size: 12px;
+        }
+        .fb-scraper-llm-row {
+            display: grid;
+            grid-template-columns: auto 100px 1fr 2fr;
+            gap: 12px;
+            align-items: center;
+            padding: 12px;
+            background: #252525;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        .fb-scraper-llm-row input[type="radio"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        .fb-scraper-llm-label {
+            color: #fff;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .fb-scraper-llm-select {
+            padding: 10px 12px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .fb-scraper-llm-select:focus {
+            outline: none;
+            border-color: #4267B2;
+        }
+        .fb-scraper-llm-apikey {
+            padding: 10px 12px;
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 14px;
+            font-family: monospace;
+            transition: all 0.2s;
+        }
+        .fb-scraper-llm-apikey:focus {
+            outline: none;
+            border-color: #4267B2;
+        }
+        .fb-scraper-llm-apikey::placeholder {
+            color: #666;
+        }
+        .fb-scraper-config-actions {
+            display: flex;
+            justify-content: flex-end;
+            padding-top: 8px;
+        }
+        .fb-scraper-btn-save {
+            background: #10b981;
+            color: #fff;
+        }
+        .fb-scraper-btn-save:hover {
+            background: #059669;
+        }
     `;
     document.head.appendChild(style);
     document.body.appendChild(overlayElement);
@@ -441,6 +734,102 @@ function showOverlay() {
                 updateOverlay();
                 chrome.runtime.sendMessage({ type: 'statusChanged', isRunning: false });
             }
+        });
+    }
+
+    // Tab switching
+    const tabButtons = overlayElement.querySelectorAll('.fb-scraper-tab');
+    const tabContents = overlayElement.querySelectorAll('.fb-scraper-tab-content');
+    tabButtons.forEach(button => {
+        button.addEventListener('click', () => {
+            const targetTab = button.getAttribute('data-tab');
+            
+            // Update active states
+            tabButtons.forEach(btn => btn.classList.remove('active'));
+            tabContents.forEach(content => content.classList.remove('active'));
+            
+            button.classList.add('active');
+            document.getElementById(`fb-scraper-tab-${targetTab}`).classList.add('active');
+        });
+    });
+
+    // Save config button
+    const saveConfigBtn = document.getElementById('fb-scraper-save-config');
+    if (saveConfigBtn) {
+        saveConfigBtn.addEventListener('click', async () => {
+            // Get category
+            const categoryInput = document.getElementById('fb-scraper-category');
+            config.category = categoryInput.value.trim();
+
+            // Get prompt
+            const promptInput = document.getElementById('fb-scraper-prompt');
+            if (promptInput) {
+                config.prompt = promptInput.value.trim();
+            }
+
+            // Get LLM provider
+            const selectedProvider = overlayElement.querySelector('input[name="llm-provider"]:checked');
+            if (selectedProvider) {
+                config.llmProvider = selectedProvider.value;
+            }
+
+            // Get OpenAI config
+            const openaiModel = document.getElementById('llm-openai-model');
+            const openaiApiKey = document.getElementById('llm-openai-apikey');
+            if (openaiModel && openaiApiKey) {
+                config.openai.model = openaiModel.value;
+                config.openai.apiKey = openaiApiKey.value;
+            }
+
+            // Get Gemini config
+            const geminiModel = document.getElementById('llm-gemini-model');
+            const geminiApiKey = document.getElementById('llm-gemini-apikey');
+            if (geminiModel && geminiApiKey) {
+                config.gemini.model = geminiModel.value;
+                config.gemini.apiKey = geminiApiKey.value;
+            }
+
+            // Save to storage
+            await saveConfig();
+            
+            // Show success feedback
+            const originalText = saveConfigBtn.textContent;
+            saveConfigBtn.textContent = '✓ Saved!';
+            saveConfigBtn.style.background = '#10b981';
+            setTimeout(() => {
+                saveConfigBtn.textContent = originalText;
+                saveConfigBtn.style.background = '#10b981';
+            }, 2000);
+        });
+    }
+
+    // Load config into UI when config tab is shown
+    const configTab = document.getElementById('fb-scraper-tab-config');
+    const configTabButton = overlayElement.querySelector('[data-tab="config"]');
+    if (configTabButton) {
+        configTabButton.addEventListener('click', async () => {
+            await loadConfig();
+            // Update UI with loaded config
+            const categoryInput = document.getElementById('fb-scraper-category');
+            if (categoryInput) categoryInput.value = config.category || '';
+            
+            const promptInput = document.getElementById('fb-scraper-prompt');
+            if (promptInput) promptInput.value = config.prompt || '';
+            
+            const openaiRadio = document.getElementById('llm-openai');
+            const geminiRadio = document.getElementById('llm-gemini');
+            if (openaiRadio) openaiRadio.checked = config.llmProvider === 'openai';
+            if (geminiRadio) geminiRadio.checked = config.llmProvider === 'gemini';
+            
+            const openaiModel = document.getElementById('llm-openai-model');
+            const openaiApiKey = document.getElementById('llm-openai-apikey');
+            if (openaiModel) openaiModel.value = config.openai.model || 'gpt-4';
+            if (openaiApiKey) openaiApiKey.value = config.openai.apiKey || '';
+            
+            const geminiModel = document.getElementById('llm-gemini-model');
+            const geminiApiKey = document.getElementById('llm-gemini-apikey');
+            if (geminiModel) geminiModel.value = config.gemini.model || 'gemini-pro';
+            if (geminiApiKey) geminiApiKey.value = config.gemini.apiKey || '';
         });
     }
 
