@@ -6,7 +6,7 @@ script.src = chrome.runtime.getURL('injected.js');
 (document.head || document.documentElement).appendChild(script);
 
 let scrappedPosts = [];
-let isScrolling = true;
+let isScrolling = false; // Set to false, don't auto-start
 const MAX_POSTS = 15; // Set your limit here
 
 // 2. Listen for messages from the injected script
@@ -14,6 +14,32 @@ window.addEventListener("message", (event) => {
     if (event.data.type === "FB_GRAPHQL_DATA") {
         parseAndStore(event.data.payload);
     }
+});
+
+// Listen for messages from popup
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'start') {
+        if (!isScrolling) {
+            isScrolling = true;
+            scrappedPosts = []; // Reset data
+            console.log("Starting scraping...");
+            autoScroll();
+            sendResponse({ success: true, isRunning: true });
+        } else {
+            sendResponse({ success: false, message: 'Already running' });
+        }
+    } else if (request.action === 'stop') {
+        if (isScrolling) {
+            isScrolling = false;
+            console.log("Stopping scraping");
+            sendResponse({ success: true, isRunning: false });
+        } else {
+            sendResponse({ success: false, message: 'Not running' });
+        }
+    } else if (request.action === 'getStatus') {
+        sendResponse({ isRunning: isScrolling });
+    }
+    return true; // Keep message channel open for async response
 });
 
 function parseAndStore(json) {
@@ -75,7 +101,10 @@ function stopAndSave() {
     a.href = url;
     a.download = `fb_feed_${Date.now()}.json`;
     a.click();
+    
+    // Notify popup that status has changed
+    chrome.runtime.sendMessage({ type: 'statusChanged', isRunning: false });
 }
 
-// Start scrolling after page load
-setTimeout(autoScroll, 3000);
+// Removed auto-start, now manual trigger only
+// setTimeout(autoScroll, 3000); // Auto-start removed
