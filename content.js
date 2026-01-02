@@ -1,107 +1,81 @@
-/**
- * FB-Timeline-Harvester
- * Sequential Logic: Scroll -> Wait -> Expand -> Capture -> Auto-Relay
- */
+// content.js
 
-const TOTAL_GOAL = 1000;
-const STAGNATION_THRESHOLD = 50000; // 50 seconds
+// 1. Inject the interceptor into the "Main World"
+const script = document.createElement('script');
+script.src = chrome.runtime.getURL('injected.js');
+(document.head || document.documentElement).appendChild(script);
 
-let currentGlobalCount = parseInt(localStorage.getItem('harvest_global_count')) || 0;
-let lastCaptureTime = Date.now();
-window.harvestedData = [];
-window.seenFingerprints = new Set();
-window.isProcessing = false;
+let scrappedPosts = [];
+let isScrolling = true;
+const MAX_POSTS = 15; // Set your limit here
 
-async function runHarvestCycle() {
-    if (window.isProcessing) return;
-    window.isProcessing = true;
-
-    // Check if goal is reached
-    if (currentGlobalCount + window.harvestedData.length >= TOTAL_GOAL) {
-        await stopAndRefresh(true);
-        return;
+// 2. Listen for messages from the injected script
+window.addEventListener("message", (event) => {
+    if (event.data.type === "FB_GRAPHQL_DATA") {
+        parseAndStore(event.data.payload);
     }
+});
 
-    // Check for stagnation
-    const idleTime = Date.now() - lastCaptureTime;
-    if (idleTime > STAGNATION_THRESHOLD && window.harvestedData.length > 0) {
-        console.log("Stagnation detected. Saving progress and reloading...");
-        await stopAndRefresh();
-        return;
-    }
+function parseAndStore(json) {
+    const node = json.data?.node || json.data?.viewer?.news_feed?.edges?.map(e => e.node);
+    const edges = json.data?.viewer?.news_feed?.edges || (json.data?.node ? [{node: json.data.node}] : []);
 
-    try {
-        // Step 1: Smooth Scrolling
-        window.scrollBy({ top: 800, behavior: 'smooth' });
-        await new Promise(r => setTimeout(r, 2000));
+    edges.forEach(edge => {
+        const item = edge.node;
+        if (!item || item.__typename !== "Story") return;
 
-        // Step 2: Handle Popups and Content Expansion
-        const closeBtn = document.querySelector('div[aria-label="Close"], div[aria-label="關閉"]');
-        if (closeBtn) closeBtn.click();
-
-        const expandButtons = document.querySelectorAll('div[role="button"], span[role="button"]');
-        expandButtons.forEach(btn => {
-            const txt = btn.innerText;
-            if (txt.includes("See more") || txt.includes("查看更多")) btn.click();
-        });
-        await new Promise(r => setTimeout(r, 1500));
-
-        // Step 3: Data Capture
-        const postTexts = document.querySelectorAll('div[data-testid="post_message"], .x11i5rnm.xat24cr, div[dir="auto"]');
-
-        postTexts.forEach(textEl => {
-            const container = textEl.closest('div[role="article"]') || textEl.parentElement.parentElement;
-            if (!container || container.hasAttribute('data-harvested')) return;
-
-            // Strip Emojis and Icons
-            let cleanText = container.innerText.replace(/[\u\d][\u\d][\u\d][\u\d]|[\u2600-\u27BF]|[\uD83C-\uD83E][\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDD10-\uDDFF]/g, "");
-            cleanText = cleanText.trim();
-
-            if (cleanText.length > 30) {
-                const fingerprint = cleanText.substring(0, 50);
-                if (!window.seenFingerprints.has(fingerprint)) {
-                    container.setAttribute('data-harvested', 'true');
-                    window.seenFingerprints.add(fingerprint);
-                    lastCaptureTime = Date.now();
-
-                    window.harvestedData.push({
-                        content: cleanText,
-                        urls: Array.from(container.querySelectorAll('a'))
-                            .map(a => a.href)
-                            .filter(u => u.startsWith('http') && !u.includes("facebook.com/groups"))
-                    });
-
-                    console.log(`Captured: [${currentGlobalCount + window.harvestedData.length}/${TOTAL_GOAL}]`);
-                }
+        const postObj = {
+            type: item.th_dat_spo ? "sponsor" : "user",
+            story_content: item.comet_sections?.content?.story?.message?.text || item.message?.text || "",
+            permanent_link: item.comet_sections?.content?.story?.wwwURL || item.permalink_url || "",
+            poster: {
+                name: item.actors?.[0]?.name || "Unknown",
+                link: item.actors?.[0]?.url || ""
             }
-        });
-    } catch (err) {
-        console.error("Cycle error:", err);
-    } finally {
-        window.isProcessing = false;
+        };
+
+        // Deduplicate by permalink
+        if (!scrappedPosts.find(p => p.permanent_link === postObj.permanent_link)) {
+            scrappedPosts.push(postObj);
+            console.log(`Captured ${scrappedPosts.length}: ${postObj.poster.name}`);
+        }
+    });
+
+    if (scrappedPosts.length >= MAX_POSTS) {
+        stopAndSave();
     }
 }
 
-async function stopAndRefresh(isFinal = false) {
-    const capturedCount = window.harvestedData.length;
-    if (capturedCount > 0) {
-        const blob = new Blob([JSON.stringify(window.harvestedData, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `FB_Batch_${currentGlobalCount + capturedCount}.json`;
-        a.click();
-    }
+// 3. Automated Scrolling Logic
+async function autoScroll() {
+    if (!isScrolling) return;
 
-    localStorage.setItem('harvest_global_count', currentGlobalCount + capturedCount);
-
-    if (isFinal) {
-        console.log("Mission accomplished.");
-        localStorage.removeItem('harvest_global_count');
-    } else {
-        location.reload();
-    }
+    window.scrollTo(0, document.body.scrollHeight);
+    
+    // Random delay between 3-5 seconds to avoid detection
+    const delay = Math.floor(Math.random() * 2000) + 3000;
+    
+    setTimeout(() => {
+        if (scrappedPosts.length < MAX_POSTS) {
+            autoScroll();
+        } else {
+            stopAndSave();
+        }
+    }, delay);
 }
 
-console.log("FB-Timeline-Harvester initialized.");
-setInterval(runHarvestCycle, 6000);
+function stopAndSave() {
+    if (!isScrolling) return;
+    isScrolling = false;
+    console.log("Scrapping Complete. Saving Data...", scrappedPosts);
+    
+    const blob = new Blob([JSON.stringify(scrappedPosts, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `fb_feed_${Date.now()}.json`;
+    a.click();
+}
+
+// Start scrolling after page load
+setTimeout(autoScroll, 3000);
