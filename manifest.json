@@ -6,15 +6,17 @@
     "permissions": [
         "storage"
     ],
+    "host_permissions": ["https://www.facebook.com/*"],
     "content_scripts": [
         {
-            "matches": [
-                "https://www.facebook.com/*"
-            ],
-            "js": [
-                "content.js"
-            ],
-            "run_at": "document_idle"
+        "matches": ["https://www.facebook.com/*"],
+        "js": ["content.js"]
+        }
+    ],
+    "web_accessible_resources": [
+        {
+        "resources": ["injected.js"],
+        "matches": ["https://www.facebook.com/*"]
         }
     ]
 }
